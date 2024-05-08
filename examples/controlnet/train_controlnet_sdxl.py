@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 
 import argparse
+import datetime
 import functools
 import gc
 import logging
@@ -27,6 +28,7 @@ from pathlib import Path
 import accelerate
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -48,7 +50,7 @@ from diffusers import (
     DDPMScheduler,
     StableDiffusionXLControlNetPipeline,
     UNet2DConditionModel,
-    UniPCMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
@@ -67,6 +69,12 @@ logger = get_logger(__name__)
 if is_torch_npu_available():
     torch.npu.config.allow_internal_format = False
 
+def util_resize_image(image_path, size):
+    image = Image.open(image_path)
+    total_pixels = image.size[0] * image.size[1]
+    ratio = (total_pixels / size) ** 0.5
+    print(f"Resizing image from {image.size} to {int(image.size[0] / ratio)}x{int(image.size[1] / ratio)}")
+    return image.resize((int(image.size[0] / ratio), int(image.size[1] / ratio)))
 
 def log_validation(vae, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False):
     logger.info("Running validation... ")
@@ -100,7 +108,7 @@ def log_validation(vae, unet, controlnet, args, accelerator, weight_dtype, step,
             torch_dtype=weight_dtype,
         )
 
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
@@ -133,15 +141,13 @@ def log_validation(vae, unet, controlnet, args, accelerator, weight_dtype, step,
         autocast_ctx = torch.autocast(accelerator.device.type)
 
     for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
-        validation_image = validation_image.resize((args.resolution, args.resolution))
-
+        validation_image = util_resize_image(validation_image, args.resolution **2)
         images = []
 
         for _ in range(args.num_validation_images):
             with autocast_ctx:
                 image = pipeline(
-                    prompt=validation_prompt, image=validation_image, num_inference_steps=20, generator=generator
+                    prompt=validation_prompt, image=validation_image, num_inference_steps=20, generator=generator, negative_prompt = "worst quality, displeasing, very displeasing, lowres, bad anatomy"
                 ).images[0]
             images.append(image)
 
@@ -693,6 +699,15 @@ def get_train_dataset(args, accelerator):
             train_dataset = train_dataset.select(range(args.max_train_samples))
     return train_dataset
 
+def dropout_caption(caption, dropout_prob):
+    caption_split = caption.split()
+    caption_result = []
+    for word in caption_split:
+        if random.random() < dropout_prob:
+            continue
+        caption_result.append(word)
+    random.shuffle(caption_result)
+    return " ".join(caption_result)
 
 # Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
 def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train=True):
@@ -703,6 +718,7 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
         if random.random() < proportion_empty_prompts:
             captions.append("")
         elif isinstance(caption, str):
+            caption = dropout_caption(caption, 0.25)
             captions.append(caption)
         elif isinstance(caption, (list, np.ndarray)):
             # take a random caption if there are multiple
@@ -807,7 +823,7 @@ def main(args):
         )
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-
+    dist.init_process_group(backend='nccl', init_method='env://', timeout=datetime.timedelta(seconds=5400)) 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
